@@ -78,27 +78,72 @@ impl Vm {
         }
     }
 
-    /// Entry point from the host: `vm.invoke_static("LCalc;", "add(II)I", &[2, 3])`.
+    /// Host entry: `vm.invoke_static("LCalc;", "add(II)I", &[2, 3])`.
     pub fn invoke_static(&mut self, class: &str, name_proto: &str, args: &[u32]) -> Result<u64> {
+        self.entry(|vm| {
+            vm.ensure_init(class)?;
+            vm.dispatch(class, class, name_proto, args)
+        })
+    }
+
+    /// Host entry: calls `name_proto` on `args[0]`, dispatching on its runtime class.
+    pub fn invoke_virtual(&mut self, name_proto: &str, args: &[u32]) -> Result<u64> {
+        self.entry(|vm| {
+            let class = vm.class_of(*args.first().ok_or("invoke_virtual without receiver")?)?;
+            vm.dispatch(&class, &class, name_proto, args)
+        })
+    }
+
+    /// Host entry: `new class()`.
+    pub fn new_object(&mut self, class: &str) -> Result<u32> {
+        self.entry(|vm| {
+            vm.ensure_init(class)?;
+            let r = vm.alloc(Object::Instance { class: class.into(), fields: HashMap::new() });
+            vm.dispatch(class, class, "<init>()V", &[r])?;
+            Ok(r)
+        })
+    }
+
+    /// Runs host calls on a big stack; nested calls (natives calling back into Java) are already on it.
+    fn entry<T: Send>(&mut self, f: impl FnOnce(&mut Vm) -> Result<T> + Send) -> Result<T> {
         if self.depth > 0 {
-            return self.invoke_static_here(class, name_proto, args); // re-entry from a native: already on the big stack
+            return f(self);
         }
         std::thread::scope(|s| {
             std::thread::Builder::new()
                 .stack_size(STACK_BYTES)
-                .spawn_scoped(s, || self.invoke_static_here(class, name_proto, args))
+                .spawn_scoped(s, || f(self))
                 .map_err(|e| format!("cannot start interpreter thread: {e}"))?
                 .join()
                 .map_err(|_| "interpreter thread panicked".to_string())?
         })
     }
 
-    fn invoke_static_here(&mut self, class: &str, name_proto: &str, args: &[u32]) -> Result<u64> {
-        self.ensure_init(class)?;
-        match self.resolve(class, name_proto) {
+    /// Looks the method up from `start`, falling back to the `declared` class: a framework receiver
+    /// (e.g. a String) has no app-code chain to walk.
+    fn dispatch(&mut self, start: &str, declared: &str, name_proto: &str, args: &[u32]) -> Result<u64> {
+        match self.resolve(start, name_proto).or_else(|| self.resolve(declared, name_proto)) {
             Some(Target::Code(loc)) => self.call(loc, args),
             Some(Target::Native(f)) => f(self, args),
-            None => Err(format!("MISSING: {class}->{name_proto}")),
+            None => Err(format!("MISSING: {declared}->{name_proto}")),
+        }
+    }
+
+    /// Host-side state on an object (framework fields like a TextView's text). Absent = None.
+    pub fn field(&self, r: u32, key: &str) -> Result<Option<u64>> {
+        match self.obj(r)? {
+            Object::Instance { fields, .. } => Ok(fields.get(key).copied()),
+            _ => Err(format!("reference {r} has no fields")),
+        }
+    }
+
+    pub fn set_field(&mut self, r: u32, key: &str, v: u64) -> Result<()> {
+        match self.obj_mut(r)? {
+            Object::Instance { fields, .. } => {
+                fields.insert(key.into(), v);
+                Ok(())
+            }
+            _ => Err(format!("reference {r} has no fields")),
         }
     }
 
@@ -128,7 +173,7 @@ impl Vm {
         }
     }
 
-    fn class_of(&self, r: u32) -> Result<String> {
+    pub fn class_of(&self, r: u32) -> Result<String> {
         Ok(match self.obj(r)? {
             Object::Instance { class, .. } => class.clone(),
             Object::Str(_) => "Ljava/lang/String;".into(),
@@ -136,8 +181,9 @@ impl Vm {
         })
     }
 
+    /// App classes answer from the dex; framework classes from the runtime's hierarchy table.
     fn superclass(&self, class: &str) -> Option<String> {
-        let &(d, c) = self.classes.get(class)?;
+        let Some(&(d, c)) = self.classes.get(class) else { return crate::runtime::superclass(class).map(Into::into) };
         let dex = &self.dexes[d];
         dex.classes[c].superclass.map(|s| dex.type_name(s).to_string())
     }
@@ -156,7 +202,8 @@ impl Vm {
     /// Walks `class` and its superclasses: app code first, then host natives for framework classes.
     fn resolve(&self, class: &str, name_proto: &str) -> Option<Target> {
         let mut cls = class.to_string();
-        loop {
+        for _ in 0..64 {
+            // bounded: a malformed dex can declare a superclass cycle
             if let Some(loc) = self.declared(&cls, name_proto) {
                 return Some(Target::Code(loc));
             }
@@ -165,6 +212,7 @@ impl Vm {
             }
             cls = self.superclass(&cls)?;
         }
+        None
     }
 
     /// Runs <clinit> once, superclass first. Classes outside the dex are the host's job.
@@ -196,12 +244,7 @@ impl Vm {
         if kind == Invoke::Static {
             self.ensure_init(&class)?;
         }
-        // a framework receiver (e.g. a String) has no dex chain, so also try the declared class
-        match self.resolve(&start, &np).or_else(|| self.resolve(&class, &np)) {
-            Some(Target::Code(loc)) => self.call(loc, args),
-            Some(Target::Native(f)) => f(self, args),
-            None => Err(format!("MISSING: {class}->{np}")),
-        }
+        self.dispatch(&start, &class, &np, args)
     }
 
     fn call(&mut self, loc: Loc, args: &[u32]) -> Result<u64> {

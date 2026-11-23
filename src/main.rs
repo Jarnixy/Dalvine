@@ -1,7 +1,7 @@
-use apkloader::{apk::Apk, axml, bytes::Result, dex::Dex};
+use apkloader::{apk::Apk, axml, bytes::Result, dex::Dex, runtime, vm::Vm};
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: apkloader <app.apk> [info|manifest|classes]";
+const USAGE: &str = "usage: apkloader <app.apk> [info|manifest|classes|run]";
 
 fn main() -> ExitCode {
     match run() {
@@ -47,6 +47,13 @@ fn run() -> Result<()> {
                     }
                 }
             }
+        }
+        "run" => {
+            let launcher = axml::launcher_activity(&manifest).ok_or("no launcher activity in manifest")?;
+            let mut vm = Vm::new(dexes);
+            let activity = vm.new_object(&format!("L{};", launcher.replace('.', "/")))?;
+            vm.invoke_virtual("onCreate(Landroid/os/Bundle;)V", &[activity, 0])?; // no saved state: null Bundle
+            print!("{}", runtime::android::dump_activity(&vm, activity)?);
         }
         _ => return Err(USAGE.into()),
     }
