@@ -185,34 +185,83 @@ pub(super) fn run(vm: &mut Vm, di: usize, code: &Code, class: &str, args: &[u32]
                 result = vm.invoke(INVOKE_KINDS[(op - 0x74) as usize], di, at(ins, pc + 1)? as u32, &args, class)?;
                 pc + 3
             }
-            // unary ops vA, vB
-            0x7b | 0x7c | 0x81 | 0x84 | 0x8d..=0x8f => {
-                if op == 0x81 {
-                    let x = get(&r, b4)? as i32 as i64 as u64; // int-to-long
-                    put2(&mut r, a4, x)?;
-                } else {
-                    let x = if op == 0x84 { get2(&r, b4)? as u32 } else { get(&r, b4)? };
-                    let v = match op {
-                        0x7b => (x as i32).wrapping_neg() as u32,
-                        0x7c => !x,
-                        0x84 => x, // long-to-int keeps the low half
-                        0x8d => x as i8 as u32,
-                        0x8e => x as u16 as u32,
-                        _ => x as i16 as u32,
-                    };
-                    put(&mut r, a4, v)?;
-                }
-                pc + 1
-            }
-            // binop-int vAA, vBB, vCC
-            0x90..=0x9a => {
+            // cmpl-float, cmpg-float, cmpl-double, cmpg-double, cmp-long vAA, vBB, vCC
+            0x2d..=0x31 => {
                 let w = at(ins, pc + 1)?;
-                let v = binop(op - 0x90, get(&r, (w & 0xff) as usize)?, get(&r, (w >> 8) as usize)?)?;
-                put(&mut r, aa, v)?;
+                let (b, c) = ((w & 0xff) as usize, (w >> 8) as usize);
+                let nan = if op == 0x2d || op == 0x2f { -1 } else { 1 }; // the l/g variants differ only on NaN
+                let v = match op {
+                    0x2d | 0x2e => f32::from_bits(get(&r, b)?).partial_cmp(&f32::from_bits(get(&r, c)?)).map_or(nan, |o| o as i32),
+                    0x2f | 0x30 => f64::from_bits(get2(&r, b)?).partial_cmp(&f64::from_bits(get2(&r, c)?)).map_or(nan, |o| o as i32),
+                    _ => (get2(&r, b)? as i64).cmp(&(get2(&r, c)? as i64)) as i32,
+                };
+                put(&mut r, aa, v as u32)?;
                 pc + 2
             }
-            // binop-int/2addr vA, vB
-            0xb0..=0xba => { let v = binop(op - 0xb0, get(&r, a4)?, get(&r, b4)?)?; put(&mut r, a4, v)?; pc + 1 }
+            // unary ops and conversions vA, vB. Rust's float→int `as` saturates and maps NaN to 0, exactly like Java.
+            0x7b..=0x8f => {
+                let (src, dst) = match op {
+                    0x7b | 0x7c | 0x8d..=0x8f => (I, I),
+                    0x7d | 0x7e => (J, J),
+                    0x7f => (F, F),
+                    0x80 => (D, D),
+                    0x81 => (I, J),
+                    0x82 => (I, F),
+                    0x83 => (I, D),
+                    0x84 => (J, I),
+                    0x85 => (J, F),
+                    0x86 => (J, D),
+                    0x87 => (F, I),
+                    0x88 => (F, J),
+                    0x89 => (F, D),
+                    0x8a => (D, I),
+                    0x8b => (D, J),
+                    _ => (D, F),
+                };
+                let x = load(&r, b4, src)?;
+                let (f, d) = (f32::from_bits(x as u32), f64::from_bits(x));
+                let v = match op {
+                    0x7b => (x as i32).wrapping_neg() as u32 as u64,
+                    0x7c => !(x as u32) as u64,
+                    0x7d => (x as i64).wrapping_neg() as u64,
+                    0x7e => !x,
+                    0x7f => (-f).to_bits() as u64,
+                    0x80 => (-d).to_bits(),
+                    0x81 => x as i32 as i64 as u64,
+                    0x82 => (x as i32 as f32).to_bits() as u64,
+                    0x83 => (x as i32 as f64).to_bits(),
+                    0x84 => x as u32 as u64,
+                    0x85 => (x as i64 as f32).to_bits() as u64,
+                    0x86 => (x as i64 as f64).to_bits(),
+                    0x87 => f as i32 as u32 as u64,
+                    0x88 => f as i64 as u64,
+                    0x89 => (f as f64).to_bits(),
+                    0x8a => d as i32 as u32 as u64,
+                    0x8b => d as i64 as u64,
+                    0x8c => (d as f32).to_bits() as u64,
+                    0x8d => x as i8 as u32 as u64,
+                    0x8e => x as u16 as u64,
+                    _ => x as i16 as u32 as u64,
+                };
+                store(&mut r, a4, dst, v)?;
+                pc + 1
+            }
+            // binop-{int,long,float,double} vAA, vBB, vCC
+            0x90..=0xaf => {
+                let w = at(ins, pc + 1)?;
+                let (k, ty) = arith(op - 0x90);
+                let x = load(&r, (w & 0xff) as usize, ty)?;
+                let y = load(&r, (w >> 8) as usize, if ty == J && k >= 8 { I } else { ty })?; // long shift distance is an int
+                store(&mut r, aa, ty, typed_op(ty, k, x, y)?)?;
+                pc + 2
+            }
+            // binop/2addr vA, vB
+            0xb0..=0xcf => {
+                let (k, ty) = arith(op - 0xb0);
+                let (x, y) = (load(&r, a4, ty)?, load(&r, b4, if ty == J && k >= 8 { I } else { ty })?);
+                store(&mut r, a4, ty, typed_op(ty, k, x, y)?)?;
+                pc + 1
+            }
             // binop-int/lit16 vA, vB, #CCCC (slot 1 is rsub)
             0xd0..=0xd7 => {
                 let v = lit_op(op - 0xd0, get(&r, b4)?, at(ins, pc + 1)? as i16 as u32)?;
@@ -255,6 +304,71 @@ fn get2(r: &[u32], i: usize) -> Result<u64> {
 fn put2(r: &mut [u32], i: usize, v: u64) -> Result<()> {
     put(r, i + 1, (v >> 32) as u32)?;
     put(r, i, v as u32)
+}
+
+/// Operand kinds: int, long, float, double. J and D occupy a register pair.
+#[derive(Clone, Copy, PartialEq)]
+enum Ty {
+    I,
+    J,
+    F,
+    D,
+}
+use Ty::*;
+
+fn load(r: &[u32], i: usize, ty: Ty) -> Result<u64> {
+    if matches!(ty, J | D) { get2(r, i) } else { get(r, i).map(u64::from) }
+}
+
+fn store(r: &mut [u32], i: usize, ty: Ty, v: u64) -> Result<()> {
+    if matches!(ty, J | D) { put2(r, i, v) } else { put(r, i, v as u32) }
+}
+
+/// Offset within the 0x90 / 0xb0 binop blocks → (operation index, operand type).
+fn arith(n: u16) -> (u16, Ty) {
+    match n {
+        0..=10 => (n, I),
+        11..=21 => (n - 11, J),
+        22..=26 => (n - 22, F),
+        _ => (n - 27, D),
+    }
+}
+
+/// Operation indices as in `binop`; floats only have add sub mul div rem (Rust `%` is Java's fmod).
+/// f32 ops run in f64 then round once: exact, since f64 has more than 2×24+2 mantissa bits.
+fn typed_op(ty: Ty, k: u16, x: u64, y: u64) -> Result<u64> {
+    let fl = |a: f64, b: f64| match k {
+        0 => a + b,
+        1 => a - b,
+        2 => a * b,
+        3 => a / b,
+        _ => a % b,
+    };
+    Ok(match ty {
+        I => binop(k, x as u32, y as u32)? as u64,
+        F => (fl(f32::from_bits(x as u32) as f64, f32::from_bits(y as u32) as f64) as f32).to_bits() as u64,
+        D => fl(f64::from_bits(x), f64::from_bits(y)).to_bits(),
+        J => {
+            let (a, b) = (x as i64, y as i64);
+            if (k == 3 || k == 4) && b == 0 {
+                return Err("ArithmeticException: divide by zero".into());
+            }
+            let s = y as u32 & 63;
+            (match k {
+                0 => a.wrapping_add(b),
+                1 => a.wrapping_sub(b),
+                2 => a.wrapping_mul(b),
+                3 => a.wrapping_div(b),
+                4 => a.wrapping_rem(b),
+                5 => a & b,
+                6 => a | b,
+                7 => a ^ b,
+                8 => a.wrapping_shl(s),
+                9 => a.wrapping_shr(s),
+                _ => (x >> s) as i64,
+            }) as u64
+        }
+    })
 }
 
 fn jump(pc: usize, off: i32) -> Result<usize> {

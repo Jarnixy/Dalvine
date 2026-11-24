@@ -14,18 +14,58 @@ use std::collections::HashMap;
 
 pub const CONTENT_VIEW: &str = "@contentView";
 pub const CHILDREN: &str = "@children";
-const ID: &str = "@id";
+pub const ID: &str = "@id";
 const CONTEXT: &str = "@context";
-const TEXT: &str = "@text";
-const TEXT_COLOR: &str = "@textColor";
-const TEXT_SIZE: &str = "@textSize";
-const BACKGROUND: &str = "@background";
-const PADDING: [&str; 4] = ["@padLeft", "@padTop", "@padRight", "@padBottom"];
-const ORIENTATION: &str = "@orientation";
-const ON_CLICK: &str = "@onClick";
-const LAYOUT_PARAMS: &str = "@layoutParams";
-const WIDTH: &str = "@width";
-const HEIGHT: &str = "@height";
+pub const TEXT: &str = "@text";
+pub const TEXT_COLOR: &str = "@textColor";
+pub const TEXT_SIZE: &str = "@textSize";
+pub const BACKGROUND: &str = "@background";
+pub const PADDING: [&str; 4] = ["@padLeft", "@padTop", "@padRight", "@padBottom"];
+pub const ORIENTATION: &str = "@orientation";
+pub const ON_CLICK: &str = "@onClick";
+pub const LAYOUT_PARAMS: &str = "@layoutParams";
+pub const WIDTH: &str = "@width";
+pub const HEIGHT: &str = "@height";
+const FINISHED: &str = "@finished";
+const MARGINS: [&str; 4] = ["leftMargin", "topMargin", "rightMargin", "bottomMargin"];
+/// Classes whose margin fields apps write directly (`lp.bottomMargin = 32`) — the interpreter keys
+/// fields by the class named in the instruction.
+const MARGIN_CLASSES: [&str; 2] = ["Landroid/view/ViewGroup$MarginLayoutParams;", "Landroid/widget/LinearLayout$LayoutParams;"];
+
+/// The inflater writes margins under the same key app code would use.
+fn margin_key(side: usize) -> String {
+    format!("{}->{}:I", MARGIN_CLASSES[0], MARGINS[side])
+}
+
+/// Margin `side` (0 left, 1 top, 2 right, 3 bottom) of a LayoutParams object, in px.
+pub fn margin(vm: &Vm, lp: u32, side: usize) -> Result<i32> {
+    for class in MARGIN_CLASSES {
+        if let Some(m) = vm.field(lp, &format!("{class}->{}:I", MARGINS[side]))? {
+            return Ok(m as i32);
+        }
+    }
+    Ok(0)
+}
+
+/// Runs the activity up to the foreground: onCreate(null) → onStart → onResume.
+pub fn start(vm: &mut Vm, activity: u32) -> Result<()> {
+    vm.invoke_virtual("onCreate(Landroid/os/Bundle;)V", &[activity, 0])?; // no saved state: null Bundle
+    vm.invoke_virtual("onStart()V", &[activity])?;
+    vm.invoke_virtual("onResume()V", &[activity]).map(drop)
+}
+
+/// onPause → onStop → onDestroy.
+pub fn stop(vm: &mut Vm, activity: u32) -> Result<()> {
+    for m in ["onPause()V", "onStop()V", "onDestroy()V"] {
+        vm.invoke_virtual(m, &[activity])?;
+    }
+    Ok(())
+}
+
+/// Set by finish() and the default onBackPressed(): the host should close the window.
+pub fn finished(vm: &Vm, activity: u32) -> Result<bool> {
+    Ok(vm.field(activity, FINISHED)?.is_some())
+}
 
 /// A native that stores argument 1 into a host field of `this`.
 macro_rules! setter {
@@ -40,6 +80,13 @@ macro_rules! setter {
 pub fn natives() -> Vec<(&'static str, Native)> {
     vec![
         ("Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V", |_, _| Ok(0)),
+        ("Landroid/app/Activity;->onStart()V", |_, _| Ok(0)),
+        ("Landroid/app/Activity;->onResume()V", |_, _| Ok(0)),
+        ("Landroid/app/Activity;->onPause()V", |_, _| Ok(0)),
+        ("Landroid/app/Activity;->onStop()V", |_, _| Ok(0)),
+        ("Landroid/app/Activity;->onDestroy()V", |_, _| Ok(0)),
+        ("Landroid/app/Activity;->finish()V", |vm, a| vm.set_field(arg(a, 0)?, FINISHED, 1).map(|_| 0)),
+        ("Landroid/app/Activity;->onBackPressed()V", |vm, a| vm.set_field(arg(a, 0)?, FINISHED, 1).map(|_| 0)),
         ("Landroid/app/Activity;->setContentView(Landroid/view/View;)V", setter!(CONTENT_VIEW)),
         ("Landroid/app/Activity;->setContentView(I)V", |vm, a| {
             let act = arg(a, 0)?;
@@ -129,7 +176,7 @@ fn add_child(vm: &mut Vm, group: u32, child: u32) -> Result<()> {
     Ok(())
 }
 
-fn children(vm: &Vm, v: u32) -> Result<Vec<u32>> {
+pub fn children(vm: &Vm, v: u32) -> Result<Vec<u32>> {
     match vm.field(v, CHILDREN)? {
         None => Ok(vec![]),
         Some(list) => match vm.obj(list as u32)? {
@@ -137,6 +184,20 @@ fn children(vm: &Vm, v: u32) -> Result<Vec<u32>> {
             _ => Err("children is not a list".into()),
         },
     }
+}
+
+/// Every view under the activity's content view, in drawing (pre-)order.
+pub fn views(vm: &Vm, activity: u32) -> Result<Vec<u32>> {
+    let mut out = vec![];
+    let mut stack: Vec<u32> = vm.field(activity, CONTENT_VIEW)?.map(|r| r as u32).into_iter().collect();
+    while let Some(v) = stack.pop() {
+        if out.len() > 100_000 {
+            return Err("view tree too large (cycle?)".into());
+        }
+        out.push(v);
+        stack.extend(children(vm, v)?.into_iter().rev());
+    }
+    Ok(out)
 }
 
 /// Depth-first search for the view with android:id `id`; 0 (null) when absent, like Android.
@@ -227,7 +288,12 @@ fn inflate(vm: &mut Vm, el: &Element, ctx: u32, depth: usize) -> Result<u32> {
                     _ => if let Some(p) = px(&val) { vm.set_field(lp, key, int(p as i32))? },
                 }
             }
-            _ => {} // shortcut: other attributes (margins, gravity, weight...) ignored until layout/rendering uses them
+            ("layout_margin", _) => if let Some(p) = px(&val) { for side in 0..4 { vm.set_field(lp, &margin_key(side), int(p as i32))? } },
+            ("layout_marginLeft" | "layout_marginTop" | "layout_marginRight" | "layout_marginBottom", _) => {
+                let side = ["layout_marginLeft", "layout_marginTop", "layout_marginRight", "layout_marginBottom"].iter().position(|n| *n == a.name).unwrap();
+                if let Some(p) = px(&val) { vm.set_field(lp, &margin_key(side), int(p as i32))? }
+            }
+            _ => {} // shortcut: other attributes (gravity, weight, start/end...) ignored until layout uses them
         }
     }
     for child in &el.children {

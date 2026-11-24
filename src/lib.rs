@@ -5,3 +5,4 @@ pub mod bytes;
 pub mod dex;
 pub mod runtime;
 pub mod vm;
+pub mod ui;
