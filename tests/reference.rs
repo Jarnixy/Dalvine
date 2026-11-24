@@ -1,7 +1,7 @@
 //! Checks our parsers against Google's own tools (dexdump, aapt2) on every APK in tests/fixtures.
 //! A tool that isn't installed skips its test with a message instead of failing.
 
-use apkloader::{apk::Apk, axml, dex::Dex};
+use apkloader::{apk::Apk, arsc::Resources, axml::{self, Value}, dex::Dex};
 use std::{collections::BTreeSet, path::PathBuf, process::Command};
 
 fn fixtures() -> Vec<PathBuf> {
@@ -110,6 +110,42 @@ fn manifest_matches_aapt2() {
 }
 
 #[test]
+fn resources_match_aapt2() {
+    let Some(aapt2) = tool("aapt2") else { return eprintln!("SKIP: aapt2 not found") };
+    let mut total = 0;
+    for apk in fixtures() {
+        let p = apk.to_str().unwrap();
+        let dump = run(&aapt2, &["dump", "resources", p]);
+        let res = Resources::parse(&Apk::open(&apk).unwrap().read("resources.arsc").unwrap()).unwrap();
+        // every "resource 0x7f..." aapt2 lists must resolve, and string values must match exactly
+        let mut lines = dump.lines().map(str::trim).peekable();
+        let mut count = 0;
+        while let Some(l) = lines.next() {
+            let Some(id) = l.strip_prefix("resource 0x") else { continue };
+            let id = u32::from_str_radix(&id[..8], 16).unwrap();
+            count += 1;
+            let v = res.get(id).unwrap_or_else(|| panic!("{p}: 0x{id:08x} missing"));
+            if let (Some(want), Value::Str(got)) = (lines.peek().and_then(|n| n.strip_prefix("() \"")), v) {
+                assert_eq!(format!("{got}\""), want, "{p}: 0x{id:08x}");
+            }
+        }
+        assert!(res.len() >= count, "{p}: aapt2 lists {count}, we have {}", res.len());
+        total += count;
+    }
+    assert!(total > 0, "no fixture has resources, so nothing was compared");
+}
+
+#[test]
+fn resource_values_decode() {
+    let res = Resources::parse(&Apk::open("tests/fixtures/layout-inflation.apk").unwrap().read("resources.arsc").unwrap()).unwrap();
+    assert_eq!(res.get(0x7f010000).and_then(Value::color), Some(0xff0e1220)); // color/bg
+    assert_eq!(res.get(0x7f020000).and_then(Value::dimension), Some((24.0, 1))); // dimen/pad = 24dp
+    assert_eq!(res.get(0x7f040000), Some(&Value::Str("res/layout/activity_main.xml".into())));
+    assert_eq!(res.get(0x7f050001), Some(&Value::Str("Hello from inflated XML".into())));
+    assert_eq!(res.get(0x7f990000), None);
+}
+
+#[test]
 fn hello_launcher() {
     let m = axml::parse(&Apk::open("tests/fixtures/hello.apk").unwrap().read("AndroidManifest.xml").unwrap()).unwrap();
     assert_eq!(m.str_attr("package"), Some("com.apkverse.demo"));
@@ -137,5 +173,6 @@ fn garbage_is_an_error_not_a_panic() {
         }
         assert!(Dex::parse(&b).is_err());
         assert!(axml::parse(&b).is_err());
+        assert!(Resources::parse(&b).is_err());
     }
 }

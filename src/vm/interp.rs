@@ -63,6 +63,21 @@ pub(super) fn run(vm: &mut Vm, di: usize, code: &Code, class: &str, args: &[u32]
                 put(&mut r, aa, s)?;
                 pc + len
             }
+            // check-cast vAA, type: null always passes
+            0x1f => {
+                let (obj, ty) = (get(&r, aa)?, dex.type_name(at(ins, pc + 1)? as u32));
+                if obj != 0 && !vm.instance_of(obj, ty)? {
+                    return Err(format!("ClassCastException: {} cannot be cast to {ty}", vm.class_of(obj)?));
+                }
+                pc + 2
+            }
+            // instance-of vA, vB, type
+            0x20 => {
+                let obj = get(&r, b4)?;
+                let yes = obj != 0 && vm.instance_of(obj, dex.type_name(at(ins, pc + 1)? as u32))?;
+                put(&mut r, a4, yes as u32)?;
+                pc + 2
+            }
             // array-length
             0x21 => {
                 let len = match vm.obj(get(&r, b4)?)? { Object::Array(v) => v.len(), _ => return Err("array-length on non-array".into()) };

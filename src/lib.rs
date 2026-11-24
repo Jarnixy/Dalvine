@@ -1,4 +1,5 @@
 pub mod apk;
+pub mod arsc;
 pub mod axml;
 pub mod bytes;
 pub mod dex;

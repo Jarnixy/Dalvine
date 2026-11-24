@@ -22,6 +22,39 @@ pub enum Value {
     Other { ty: u8, data: u32 },
 }
 
+/// Decodes a Res_value (shared by binary XML attributes and resources.arsc entries).
+pub fn res_value(ty: u8, data: u32, strings: &[String]) -> Value {
+    match ty {
+        0x03 => Value::Str(strings.get(data as usize).cloned().unwrap_or_default()),
+        0x10 | 0x11 => Value::Int(data as i32),
+        0x12 => Value::Bool(data != 0),
+        0x01 => Value::Ref(data),
+        _ => Value::Other { ty, data },
+    }
+}
+
+impl Value {
+    /// TYPE_DIMENSION → (amount, unit) where unit 0=px 1=dp 2=sp 3=pt 4=in 5=mm.
+    pub fn dimension(&self) -> Option<(f32, u8)> {
+        const RADIX: [f32; 4] = [1.0 / 256.0, 1.0 / 32768.0, 1.0 / 8388608.0, 1.0 / 2147483648.0];
+        match *self {
+            Value::Other { ty: 0x05, data } => {
+                Some(((data & 0xffff_ff00) as i32 as f32 * RADIX[(data >> 4 & 3) as usize], (data & 0xf) as u8))
+            }
+            _ => None,
+        }
+    }
+
+    /// Any of the four compiled color types (already expanded to ARGB), or a plain int.
+    pub fn color(&self) -> Option<u32> {
+        match *self {
+            Value::Other { ty: 0x1c..=0x1f, data } => Some(data),
+            Value::Int(i) => Some(i as u32),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Attr {
     pub ns: Option<String>,
@@ -131,14 +164,7 @@ fn start_element(c: &[u8], ext: usize, strings: &[String], resmap: &[u32]) -> Re
         let raw = u32_at(c, a + 8)?;
         let ty = u8_at(c, a + 15)?;
         let data = u32_at(c, a + 16)?;
-        let value = match ty {
-            _ if raw != NO_INDEX => Value::Str(s(raw)),
-            0x03 => Value::Str(s(data)),
-            0x10 | 0x11 => Value::Int(data as i32),
-            0x12 => Value::Bool(data != 0),
-            0x01 => Value::Ref(data),
-            _ => Value::Other { ty, data },
-        };
+        let value = if raw != NO_INDEX { Value::Str(s(raw)) } else { res_value(ty, data, strings) };
         el.attrs.push(Attr {
             ns: (ns != NO_INDEX).then(|| s(ns)),
             name: s(name),

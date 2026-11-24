@@ -2,7 +2,7 @@
 
 mod interp;
 
-use crate::{bytes::Result, dex::Dex};
+use crate::{apk::Apk, arsc::Resources, bytes::Result, dex::Dex};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -57,6 +57,9 @@ pub struct Vm {
     initialized: HashSet<String>,
     natives: HashMap<&'static str, Native>,
     depth: usize,
+    /// The app's files (layouts, assets) and compiled resources; None when running a bare dex.
+    pub apk: Option<Apk>,
+    pub res: Option<Resources>,
 }
 
 impl Vm {
@@ -75,6 +78,8 @@ impl Vm {
             initialized: HashSet::new(),
             natives: crate::runtime::natives(),
             depth: 0,
+            apk: None,
+            res: None,
         }
     }
 
@@ -96,12 +101,47 @@ impl Vm {
 
     /// Host entry: `new class()`.
     pub fn new_object(&mut self, class: &str) -> Result<u32> {
+        self.construct(class, "<init>()V", &[])
+    }
+
+    /// `new class(args)` through the constructor `init`, e.g. `<init>(Landroid/content/Context;)V`.
+    pub fn construct(&mut self, class: &str, init: &str, args: &[u32]) -> Result<u32> {
         self.entry(|vm| {
             vm.ensure_init(class)?;
             let r = vm.alloc(Object::Instance { class: class.into(), fields: HashMap::new() });
-            vm.dispatch(class, class, "<init>()V", &[r])?;
+            vm.dispatch(class, class, init, &[&[r], args].concat())?;
             Ok(r)
         })
+    }
+
+    /// Java `r instanceof target` for a non-null reference.
+    pub fn instance_of(&self, r: u32, target: &str) -> Result<bool> {
+        if target == "Ljava/lang/Object;" {
+            return Ok(true);
+        }
+        Ok(match self.obj(r)? {
+            // shortcut: array element types aren't tracked, so any array matches any array type
+            Object::Array(_) => target.starts_with('['),
+            Object::Str(_) => {
+                matches!(target, "Ljava/lang/String;" | "Ljava/lang/CharSequence;" | "Ljava/lang/Comparable;" | "Ljava/io/Serializable;")
+            }
+            Object::Instance { class, .. } => self.is_subtype(class, target, 0),
+        })
+    }
+
+    fn is_subtype(&self, class: &str, target: &str, depth: usize) -> bool {
+        if class == target {
+            return true;
+        }
+        if depth > 64 {
+            return false; // malformed hierarchy cycle
+        }
+        let interfaces = self.classes.get(class).map_or(vec![], |&(d, c)| {
+            let dex = &self.dexes[d];
+            dex.classes[c].interfaces.iter().map(|&t| dex.type_name(t as u32).to_string()).collect()
+        });
+        self.superclass(class).is_some_and(|s| self.is_subtype(&s, target, depth + 1))
+            || interfaces.iter().any(|i| self.is_subtype(i, target, depth + 1))
     }
 
     /// Runs host calls on a big stack; nested calls (natives calling back into Java) are already on it.

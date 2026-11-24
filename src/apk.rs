@@ -30,6 +30,10 @@ impl Apk {
         Ok(out)
     }
 
+    pub fn has(&self, name: &str) -> bool {
+        self.zip.index_for_name(name).is_some()
+    }
+
     /// classes.dex, classes2.dex, ... in load order.
     pub fn dex_names(&self) -> Vec<String> {
         let mut names: Vec<(u32, String)> = self

@@ -1,4 +1,4 @@
-use apkloader::{apk::Apk, axml, bytes::Result, dex::Dex, runtime, vm::Vm};
+use apkloader::{apk::Apk, axml, bytes::Result, dex::Dex, runtime};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: apkloader <app.apk> [info|manifest|classes|run]";
@@ -49,9 +49,7 @@ fn run() -> Result<()> {
             }
         }
         "run" => {
-            let launcher = axml::launcher_activity(&manifest).ok_or("no launcher activity in manifest")?;
-            let mut vm = Vm::new(dexes);
-            let activity = vm.new_object(&format!("L{};", launcher.replace('.', "/")))?;
+            let (mut vm, activity) = runtime::android::launch(path)?;
             vm.invoke_virtual("onCreate(Landroid/os/Bundle;)V", &[activity, 0])?; // no saved state: null Bundle
             print!("{}", runtime::android::dump_activity(&vm, activity)?);
         }
